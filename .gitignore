@@ -2,9 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
-submissions/*.bundle
 runs/
 kit/world/*/
 !kit/world/*.py
 *.local.json
 PLAN.md
+.claude/
+*.zip
+*.sha256
+submissions/
