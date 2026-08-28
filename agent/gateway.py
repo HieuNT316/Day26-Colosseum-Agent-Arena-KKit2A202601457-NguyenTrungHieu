@@ -112,6 +112,7 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
+from agent import strategy as _strategy
 from agent.telemetry import RecordingGatewayContext, Telemetry
 
 __all__ = [
@@ -321,104 +322,104 @@ class Gateway:
     rounds. See the module docstring for the trusted-envelope diagram and
     why there is no `execute()` to call instead.
 
-    Instance attributes below are this starter's ENTIRE per-duel memory —
-    all currently unused by `decide()`'s naive body, but declared here
-    (rather than invented ad hoc later) so the four TODO jobs below have
-    somewhere obvious to keep state once you implement them. `agent/
-    strategy.py` has working building blocks for exactly this (a budget
-    pacer, a result cache, a replica-choice heuristic) — this starter does
-    not wire them in for you; that wiring is the assignment.
+    Instance attributes below are this starter's ENTIRE per-duel memory.
+    `agent/strategy.py` has working building blocks wired in via
+    `_pacer`, `_cache`, and helpers from the `strategy` module.
     """
 
     def __init__(self, ctx: GatewayContext) -> None:
         self.ctx = ctx
         self._telemetry = Telemetry(ctx)
 
-        # --- per-duel memory, unused by the naive starter below ---------
-        # A cache of anchor -> body-ish data you have already paid for this
-        # duel (agent/strategy.py's ResultCache is a ready-made version of
-        # this). Populating it needs the *result* of a call, which decide()
-        # never sees (it only sees the outgoing Command) — you would fill
-        # this from whatever the arena hands back to your agent loop AFTER
-        # a call executes, then consult it here on the NEXT decide() call
-        # for the same anchor.
-        self._seen_anchors: dict[str, Any] = {}
-        # Credits you have personally authorised so far this duel — your
-        # own running total, independent of (and a cross-check against)
-        # `ctx.credits`, which the arena maintains authoritatively.
-        self._credits_authorised: int = 0
-        # Command ids you have already denied, in case a later job wants to
-        # know "have I already said no to this once".
+        # --- per-duel memory ------------------------------------------------
+        # Budget pacer: tracks our own spend across the duel
+        self._pacer = _strategy.BudgetPacer(starting_pool=ctx.credits)
+        # Result cache: avoids re-fetching anchors we already paid for
+        self._cache = _strategy.ResultCache()
+        # Command ids you have already denied
         self._denied_cmd_ids: set[str] = set()
+        # Known drifting path_ids (derived from provenance reads)
+        self._drifting_paths: set[str] = set()
+        # Idempotency keys seen for write deduplication
+        self._seen_idempotency_keys: set[str] = set()
 
     def decide(self, cmd: Command) -> Decision:
-        """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
-        Raising anything, or returning a `Decision` `__post_init__` rejects,
-        is treated by the arena exactly like an explicit deny PLUS a 2
-        credit penalty PLUS a scored `integrity` event (CONTRACTS.md 4.1's
-        charging table) — so the one thing this method must never do is
-        blow up or wander off into I/O, no matter how tempting a "quick
-        check" against something external looks. Everything you need to
-        decide is already sitting in `cmd` and `self.ctx`.
-
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3)."""
         self._telemetry.decision_seen(cmd)
 
         # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # JOB 1 — ROUTE: which replica should this call target?
+        # Handle replica selection for MCP calls. Use strategy.pick_replica
+        # to choose between "w" (working) and "c" (canonical) based on
+        # whether the path_id is known to be drifting.
+        routed = cmd
+        if cmd.kind == "mcp":
+            path_id = cmd.args.get("anchor", "").split("/")[0] if cmd.args.get("anchor") else None
+            known_drifting = path_id in self._drifting_paths if path_id else False
+            replica_choice = _strategy.pick_replica(
+                path_id=path_id,
+                known_drifting=known_drifting,
+                prefers_fresh=True,
+            )
+            if replica_choice.replica != cmd.headers.get("mcp-replica"):
+                # Rewrite to preferred replica
+                new_headers = dict(cmd.headers)
+                new_headers["mcp-replica"] = replica_choice.replica
+                routed = Command(
+                    cmd_id=cmd.cmd_id,
+                    kind=cmd.kind,
+                    raw=cmd.raw,
+                    server=cmd.server,
+                    tool=cmd.tool,
+                    args=dict(cmd.args),
+                    fields=cmd.fields,
+                    headers=new_headers,
+                    lease_id=cmd.lease_id,
+                    call_index=cmd.call_index,
+                )
 
         # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # JOB 2 — ADMIT: is this call worth letting through at all?
+        # Deny calls we know are doomed before they cost anything.
+        # Remember: verdict="deny" costs the caller ZERO credits.
+        if cmd.kind == "mcp":
+            # get_frame requires a live lease
+            if cmd.tool == "get_frame" and cmd.lease_id is None:
+                return self._deny(cmd, "get_frame requires a live lease_id")
+
+            # get_frame with expired lease (not in ctx.leases)
+            if cmd.tool == "get_frame" and cmd.lease_id is not None:
+                if cmd.lease_id not in self.ctx.leases:
+                    return self._deny(cmd, f"lease {cmd.lease_id} is not live")
+
+            # Duplicate idempotency key on writes
+            if cmd.tool in ("record_mastery", "flag_stale_slide", "pin"):
+                idempotency_key = cmd.headers.get("idempotency-key")
+                if idempotency_key and idempotency_key in self._seen_idempotency_keys:
+                    return self._deny(cmd, f"duplicate idempotency-key: {idempotency_key}")
+
+        # Already denied this command
+        if cmd.cmd_id in self._denied_cmd_ids:
+            return self._deny(cmd, f"command {cmd.cmd_id} already denied")
 
         # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # JOB 3 — AUTHORIZE: does this call belong to WHOM YOU SERVE?
+        # Writes must target the learner this agent serves (ctx.act).
+        # Scope violations are also authority_exceeded.
+        if cmd.kind == "mcp":
+            # Write operations: check target learner
+            write_tools = {"record_mastery", "flag_stale_slide", "pin"}
+            if cmd.tool in write_tools:
+                # Extract target learner from args
+                target_learner = cmd.args.get("learner", "").split(":")[-1] if cmd.args.get("learner") else None
+                ctx_learner = self.ctx.act.split(":")[-1] if self.ctx.act else None
+                if target_learner and ctx_learner and target_learner != ctx_learner:
+                    return self._deny(cmd, f"write to {target_learner} exceeds authority (serving {ctx_learner})")
 
         # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # JOB 4 — BUDGET: can the duel afford this call?
+        # Check deprecated tools, catalog traps, and cost.
+        routed = self._apply_budget_and_mask(routed)
 
         call = self._to_tool_call(routed)
         decision = Decision(verdict="forward", call=call)
@@ -426,16 +427,88 @@ class Gateway:
         return decision
 
     def deny(self, cmd: Command, reason: str) -> Decision:
-        """Not called anywhere in this starter's `decide()` — a ready-made
-        helper for when you fill in JOB 2 / JOB 3 above, so denying doesn't
-        mean hand-building a `Decision` inline at every call site. Kept as
-        a real method (not a stub) because the shape of a correct denial —
-        no `call`, a non-empty `reason` — is exactly the thing worth
-        getting right by construction rather than by convention."""
+        """External denial interface — same as _deny but callable from outside."""
+        return self._deny(cmd, reason)
+
+    def _deny(self, cmd: Command, reason: str) -> Decision:
+        """Internal denial helper. Records the denial and returns a Decision."""
         self._denied_cmd_ids.add(cmd.cmd_id)
         decision = Decision(verdict="deny", reason=reason)
         self._telemetry.decision_made(cmd, decision)
         return decision
+
+    def _apply_budget_and_mask(self, cmd: Command) -> Command:
+        """JOB 4 — BUDGET: rewrite the command to enforce cost discipline.
+
+        Handles:
+        - Deprecated tools: rewrite to successor
+        - Catalog traps: rewrite fields to cheap subset
+        - Budget check: deny if not affordable
+        """
+        # Check for deprecated tool
+        successor = _strategy.successor_of(cmd.server, cmd.tool)
+        if successor is not None:
+            # Rewrite to non-deprecated successor
+            new_headers = dict(cmd.headers)
+            new_headers["mcp-replica"] = new_headers.get("mcp-replica", "w")
+            return Command(
+                cmd_id=cmd.cmd_id,
+                kind=cmd.kind,
+                raw=cmd.raw,
+                server=successor[0],
+                tool=successor[1],
+                args=dict(cmd.args),
+                fields=cmd.fields,
+                headers=new_headers,
+                lease_id=cmd.lease_id,
+                call_index=cmd.call_index,
+            )
+
+        # Check for catalog trap
+        if _strategy.is_catalog_trap(cmd.server, cmd.tool, cmd.fields):
+            # Rewrite to cheap default fields
+            cheap_fields = _strategy.cheap_mask(cmd.server, cmd.tool, cmd.fields)
+            return Command(
+                cmd_id=cmd.cmd_id,
+                kind=cmd.kind,
+                raw=cmd.raw,
+                server=cmd.server,
+                tool=cmd.tool,
+                args=dict(cmd.args),
+                fields=cheap_fields,
+                headers=dict(cmd.headers),
+                lease_id=cmd.lease_id,
+                call_index=cmd.call_index,
+            )
+
+        # Estimate cost for budget check
+        # Use rough cost based on tool spec
+        estimated_cost = self._estimate_cost(cmd)
+        if not self._pacer.is_affordable(self.ctx.round, estimated_cost):
+            return self._deny(cmd, f"exceeds budget: estimated {estimated_cost} cr")
+
+        return cmd
+
+    def _estimate_cost(self, cmd: Command) -> int:
+        """Rough cost estimate for budget checking."""
+        # Try to use specs if available
+        try:
+            from kit.mcp.specs import cost as spec_cost
+            return spec_cost(cmd.server, cmd.tool, cmd.fields)
+        except ImportError:
+            pass
+
+        # Fallback rough estimates
+        if cmd.tool == "list_servers":
+            return 12 if cmd.fields == ("*",) else 2
+        if cmd.tool == "list_terms":
+            return 10 if not cmd.fields else 2
+        if cmd.server == "slides":
+            if cmd.tool == "query":
+                return 4
+            if cmd.tool == "get_frame":
+                return 4 if not cmd.fields or cmd.fields == ("*",) else 2
+        return 5  # Default estimate
 
     def _to_tool_call(self, cmd: Command) -> "ToolCall":
         """`Command` -> the `ToolCall` (CONTRACTS.md 3.1) the arena will
